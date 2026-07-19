@@ -240,7 +240,9 @@ function loop(now){
   if (sideDoneness[currentSide] >= 1) { render(); endGame(); return; }
 
   render();
-  hud.textContent = `คะแนน: ${score}`;
+  const d = sideDoneness[currentSide];
+  const inGolden = d >= CONFIG.GOLDEN_MIN && d < CONFIG.GOLDEN_MAX;
+  hud.innerHTML = `คะแนน: ${score}` + (inGolden ? `<div style="color:#7CFC00;font-size:.8em;">พลิกตอนนี้!</div>` : '');
   requestAnimationFrame(loop);
 }
 
@@ -289,6 +291,24 @@ function render(){
     ctx.fillStyle = 'rgba(0,0,0,' + Math.min(0.5,(sideDoneness[currentSide]-CONFIG.GOLDEN_MAX)*2) + ')';
     ctx.beginPath(); ctx.ellipse(fx,fy,50,42,0,0,Math.PI*2); ctx.fill();
   }
+
+  drawMeter();
+}
+
+// doneness meter: bar with golden band marked + current-value pointer
+function drawMeter(){
+  const w = Math.min(280, canvas.width * 0.7), h = 14;
+  const x = (canvas.width - w) / 2, y = 60;
+  const g0x = x + CONFIG.GOLDEN_MIN * w, g1x = x + CONFIG.GOLDEN_MAX * w;
+
+  ctx.fillStyle = '#eee'; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = '#3ddc3d'; ctx.fillRect(g0x, y, g1x - g0x, h);
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.strokeRect(x, y, w, h);
+
+  const d = sideDoneness[currentSide];
+  const px = x + d * w;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.moveTo(px, y - 8); ctx.lineTo(px - 6, y - 1); ctx.lineTo(px + 6, y - 1); ctx.closePath(); ctx.fill();
 }
 render();
 </script>
