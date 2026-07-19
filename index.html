@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>ทอดไข่ดาว - Pan Flip</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#1a1a1a;height:100%;width:100%;touch-action:none;-webkit-user-select:none;user-select:none;}
+  canvas{display:block;position:absolute;top:0;left:0;}
+  .screen{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;font-family:sans-serif;text-align:center;background:rgba(0,0,0,.72);z-index:10;gap:16px;padding:20px;box-sizing:border-box;}
+  .hidden{display:none;}
+  h1{font-size:1.8em;margin:0;}
+  .score{font-size:1.2em;}
+  button{font-size:1.2em;padding:14px 32px;border-radius:10px;border:none;background:#ffb703;color:#1a1a1a;font-weight:bold;}
+  #hud{position:absolute;top:10px;left:0;right:0;text-align:center;color:#fff;font-family:sans-serif;font-size:1.4em;z-index:5;text-shadow:0 1px 3px #000;}
+  #cornerTap{position:absolute;top:0;left:0;width:60px;height:60px;z-index:20;}
+  #debugOverlay{position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.75);color:#0f0;font:11px monospace;padding:6px;white-space:pre;z-index:30;}
+</style>
+</head>
+<body>
+<!--
+Build Notes (assumptions not fully pinned by SPEC.md):
+1. "Current-side doneness visible" (SPEC §2.3) rendered as the food color = the
+   currently face-down (cooking) side's doneness, since that's the side whose
+   state determines burn/game-over and what the player must time a flip against.
+2. Desktop fallback uses the literal feature-detect named in SPEC §2.6:
+   `typeof DeviceMotionEvent === 'undefined'`. Some desktop browsers define the
+   event but never fire it (no real sensor) — spec explicitly names this check,
+   so it's used as-is rather than adding an extra heuristic.
+3. iOS also gates DeviceOrientationEvent.requestPermission (needed for tilt
+   cosmetics) alongside DeviceMotionEvent.requestPermission inside the Start
+   tap, since SPEC §6 only mentioned the motion permission but tilt requires it too.
+4. Debug overlay logs "SHAKE (rejected)" whenever an accel spike fires without a
+   matching gyro spike in FLIP_WINDOW_MS — informational only; gameplay flip
+   logic already rejects it via the AND condition regardless of logging.
+-->
+<canvas id="game"></canvas>
+<div id="hud" class="hidden"></div>
+
+<div id="startScreen" class="screen">
+  <h1>ทอดไข่ดาว</h1>
+  <div class="score" id="bestScoreLabel">คะแนนสูงสุด: 0</div>
+  <button id="startBtn">แตะเพื่อเริ่ม</button>
+  <div id="permMsg" style="display:none;color:#f88;">ต้องอนุญาตการเข้าถึงเซ็นเซอร์เพื่อเล่น</div>
+</div>
+
+<div id="desktopFallback" class="screen hidden">
+  <h1>เกมนี้เล่นบนมือถือเท่านั้น</h1>
+</div>
+
+<div id="gameOverScreen" class="screen hidden">
+  <h1>ไข่ไหม้!</h1>
+  <div class="score" id="finalScoreLabel"></div>
+  <div class="score" id="bestScoreLabel2"></div>
+  <button id="restartBtn">แตะเพื่อเริ่มใหม่</button>
+</div>
+
+<div id="cornerTap"></div>
+<div id="debugOverlay" class="hidden"></div>
+
+<script>
+const CONFIG = {
+  // Flip detection
+  FLIP_ACCEL_THRESHOLD: 12,   // m/s^2 — tune on real device
+  FLIP_GYRO_THRESHOLD: 200,   // deg/s — tune on real device
+  FLIP_WINDOW_MS: 150,
+  FLIP_COOLDOWN_MS: 500,
+  // Cooking
+  GOLDEN_MIN: 0.55,
+  GOLDEN_MAX: 0.85,
+  COOK_SPEED_START: 0.08,     // doneness/sec
+  COOK_SPEED_RAMP: 0.005,
+  COOK_SPEED_MAX: 0.30,
+  // Food
+  FOOD: 'fried_egg',
+  // Tilt
+  TILT_SMOOTHING: 0.12,
+  TILT_MAX_OFFSET: 60,        // px food can slide off-center inside pan
+};
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+const startScreen = document.getElementById('startScreen');
+const gameOverScreen = document.getElementById('gameOverScreen');
+const desktopFallback = document.getElementById('desktopFallback');
+const permMsg = document.getElementById('permMsg');
+const debugOverlay = document.getElementById('debugOverlay');
+
+function resize(){canvas.width=innerWidth;canvas.height=innerHeight;}
+addEventListener('resize', resize);
+resize();
+
+// ---------- state ----------
+let state = 'start'; // start | playing | gameover | desktop
+let sideDoneness = [0, 0];   // [sideA, sideB]
+let currentSide = 0;         // index of face-down (cooking) side
+let cookSpeed = CONFIG.COOK_SPEED_START;
+let score = 0;
+let best = Number(localStorage.getItem('panflip_best') || 0);
+let wakeLock = null;
+
+let tiltX = 0, tiltY = 0; // smoothed offsets
+let lastMotionMag = 0, lastGyroMag = 0, lastEvent = '-';
+let accelSpikeAt = 0, gyroSpikeAt = 0, lastFlipAt = -Infinity;
+
+// ---------- debug overlay (triple-tap top-left) ----------
+let tapTimes = [];
+document.getElementById('cornerTap').addEventListener('pointerdown', () => {
+  const now = performance.now();
+  tapTimes = tapTimes.filter(t => now - t < 600);
+  tapTimes.push(now);
+  if (tapTimes.length >= 3) { debugOverlay.classList.toggle('hidden'); tapTimes = []; }
+});
+function updateDebug(){
+  if (debugOverlay.classList.contains('hidden')) return;
+  debugOverlay.textContent =
+    `accel: ${lastMotionMag.toFixed(2)}  gyro: ${lastGyroMag.toFixed(1)}\nlast: ${lastEvent}`;
+}
+
+// ---------- feature detect (SPEC §2.6) ----------
+if (typeof DeviceMotionEvent === 'undefined') {
+  state = 'desktop';
+  startScreen.classList.add('hidden');
+  desktopFallback.classList.remove('hidden');
+}
+
+document.getElementById('bestScoreLabel').textContent = `คะแนนสูงสุด: ${best}`;
+
+// ---------- start / permission ----------
+document.getElementById('startBtn').addEventListener('click', async () => {
+  if (typeof DeviceMotionEvent.requestPermission === 'function') {
+    try {
+      const r1 = await DeviceMotionEvent.requestPermission();
+      let r2 = 'granted';
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        r2 = await DeviceOrientationEvent.requestPermission();
+      }
+      if (r1 !== 'granted' || r2 !== 'granted') { permMsg.style.display = 'block'; return; }
+    } catch (e) { permMsg.style.display = 'block'; return; }
+  }
+  permMsg.style.display = 'none';
+  startGame();
+});
+document.getElementById('restartBtn').addEventListener('click', startGame);
+
+function startGame(){
+  sideDoneness = [0, 0];
+  currentSide = 0;
+  cookSpeed = CONFIG.COOK_SPEED_START;
+  score = 0;
+  accelSpikeAt = 0; gyroSpikeAt = 0; lastFlipAt = -Infinity;
+  state = 'playing';
+  startScreen.classList.add('hidden');
+  gameOverScreen.classList.add('hidden');
+  hud.classList.remove('hidden');
+  addEventListener('devicemotion', onMotion);
+  addEventListener('deviceorientation', onOrientation);
+  requestWakeLock();
+  lastTick = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function endGame(){
+  state = 'gameover';
+  removeEventListener('devicemotion', onMotion);
+  removeEventListener('deviceorientation', onOrientation);
+  releaseWakeLock();
+  if (score > best) { best = score; localStorage.setItem('panflip_best', String(best)); }
+  document.getElementById('finalScoreLabel').textContent = `คะแนน: ${score}`;
+  document.getElementById('bestScoreLabel2').textContent = `คะแนนสูงสุด: ${best}`;
+  hud.classList.add('hidden');
+  gameOverScreen.classList.remove('hidden');
+}
+
+// ---------- wake lock ----------
+async function requestWakeLock(){
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+async function releaseWakeLock(){
+  try { if (wakeLock) { await wakeLock.release(); wakeLock = null; } } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (state === 'playing' && document.visibilityState === 'visible') requestWakeLock();
+});
+
+// ---------- motion: flip detection ----------
+function onMotion(e){
+  const a = e.acceleration && (e.acceleration.x || e.acceleration.y || e.acceleration.z)
+    ? e.acceleration : e.accelerationIncludingGravity;
+  if (!a) return;
+  const ax = a.x||0, ay = a.y||0, az = a.z||0;
+  lastMotionMag = Math.sqrt(ax*ax+ay*ay+az*az);
+
+  const r = e.rotationRate || {};
+  const rx = r.alpha||0, ry = r.beta||0, rz = r.gamma||0;
+  lastGyroMag = Math.sqrt(rx*rx+ry*ry+rz*rz);
+
+  const now = performance.now();
+  if (lastMotionMag > CONFIG.FLIP_ACCEL_THRESHOLD) accelSpikeAt = now;
+  if (lastGyroMag > CONFIG.FLIP_GYRO_THRESHOLD) gyroSpikeAt = now;
+
+  const bothSpiked = accelSpikeAt && gyroSpikeAt && Math.abs(accelSpikeAt - gyroSpikeAt) <= CONFIG.FLIP_WINDOW_MS;
+  if (bothSpiked && now - lastFlipAt > CONFIG.FLIP_COOLDOWN_MS) {
+    lastFlipAt = now;
+    accelSpikeAt = 0; gyroSpikeAt = 0;
+    lastEvent = 'FLIP';
+    if (state === 'playing') doFlip();
+  } else if (lastMotionMag > CONFIG.FLIP_ACCEL_THRESHOLD && !bothSpiked) {
+    lastEvent = 'SHAKE (rejected)';
+  }
+  updateDebug();
+}
+
+function onOrientation(e){
+  const beta = e.beta || 0, gamma = e.gamma || 0;
+  const targetX = Math.max(-1, Math.min(1, gamma / 45)) * CONFIG.TILT_MAX_OFFSET;
+  const targetY = Math.max(-1, Math.min(1, (beta-45) / 45)) * CONFIG.TILT_MAX_OFFSET;
+  tiltX += (targetX - tiltX) * CONFIG.TILT_SMOOTHING;
+  tiltY += (targetY - tiltY) * CONFIG.TILT_SMOOTHING;
+}
+
+function doFlip(){
+  const wasGolden = sideDoneness[currentSide] >= CONFIG.GOLDEN_MIN && sideDoneness[currentSide] < CONFIG.GOLDEN_MAX;
+  currentSide = 1 - currentSide;
+  if (wasGolden) {
+    score++;
+    cookSpeed = Math.min(CONFIG.COOK_SPEED_MAX, cookSpeed + CONFIG.COOK_SPEED_RAMP);
+  }
+}
+
+// ---------- cook loop ----------
+let lastTick = performance.now();
+function loop(now){
+  if (state !== 'playing') return;
+  const dt = Math.min(0.1, (now - lastTick) / 1000);
+  lastTick = now;
+
+  sideDoneness[currentSide] = Math.min(1, sideDoneness[currentSide] + cookSpeed * dt);
+  if (sideDoneness[currentSide] >= 1) { render(); endGame(); return; }
+
+  render();
+  hud.textContent = `คะแนน: ${score}`;
+  requestAnimationFrame(loop);
+}
+
+// ---------- render ----------
+function donenessColor(d){
+  const g0 = CONFIG.GOLDEN_MIN, g1 = CONFIG.GOLDEN_MAX;
+  let r,g,b;
+  if (d < g0) {                       // raw -> golden
+    const t = d / g0;
+    r = lerp(255,230,t); g = lerp(245,180,t); b = lerp(220,80,t);
+  } else if (d < g1) {                // golden zone
+    const t = (d-g0)/(g1-g0);
+    r = lerp(230,200,t); g = lerp(180,120,t); b = lerp(80,40,t);
+  } else {                            // overcook -> burnt
+    const t = (d-g1)/(1-g1);
+    r = lerp(200,20,t); g = lerp(120,10,t); b = lerp(40,10,t);
+  }
+  return `rgb(${r|0},${g|0},${b|0})`;
+}
+function lerp(a,b,t){ return a+(b-a)*t; }
+
+function render(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const cx = canvas.width/2, cy = canvas.height/2;
+  const panR = Math.min(canvas.width, canvas.height) * 0.38;
+
+  // pan
+  ctx.fillStyle = '#333';
+  ctx.beginPath(); ctx.arc(cx,cy,panR,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 8;
+  ctx.beginPath(); ctx.arc(cx,cy,panR,0,Math.PI*2); ctx.stroke();
+
+  // food (fried egg) at tilt-offset position, clamped inside pan
+  let fx = cx + tiltX, fy = cy + tiltY;
+  const maxDist = panR - 55;
+  const dx = fx-cx, dy = fy-cy, dist = Math.hypot(dx,dy);
+  if (dist > maxDist) { fx = cx + dx/dist*maxDist; fy = cy + dy/dist*maxDist; }
+
+  const color = donenessColor(sideDoneness[currentSide]);
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.ellipse(fx,fy,50,42,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#ffd23f';
+  ctx.beginPath(); ctx.arc(fx,fy,18,0,Math.PI*2); ctx.fill();
+
+  if (sideDoneness[currentSide] > CONFIG.GOLDEN_MAX) {
+    ctx.fillStyle = 'rgba(0,0,0,' + Math.min(0.5,(sideDoneness[currentSide]-CONFIG.GOLDEN_MAX)*2) + ')';
+    ctx.beginPath(); ctx.ellipse(fx,fy,50,42,0,0,Math.PI*2); ctx.fill();
+  }
+}
+render();
+</script>
+</body>
+</html>
